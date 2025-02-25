@@ -1,0 +1,11 @@
+../Drivers/CMSIS/Include/core_cm4.h:1938:34:__NVIC_SystemReset	4	static,ignoring_inline_asm
+../Core/Src/freertos.c:131:6:MX_FREERTOS_Init	8	static
+../Core/Src/freertos.c:173:6:StartDefaultTask	104	static
+../Core/Src/freertos.c:289:6:Init_joint_state_msg	40	static
+../Core/Src/freertos.c:329:13:setupPins	8	static
+../Core/Src/freertos.c:348:13:update_encoders	16	static
+../Core/Src/freertos.c:366:13:encoder_timer_callback	88	static
+../Core/Src/freertos.c:407:13:cmd_vel_callback	32	static
+../Core/Src/freertos.c:414:13:timer_callback	56	static
+../Core/Src/freertos.c:443:14:fmap	32	static
+../Core/Src/freertos.c:447:13:cleanup	8	static

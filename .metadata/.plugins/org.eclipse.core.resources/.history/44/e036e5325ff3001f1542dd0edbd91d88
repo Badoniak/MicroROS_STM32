@@ -1,0 +1,507 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * File Name          : freertos.c
+  * Description        : Code for freertos applications
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2025 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "FreeRTOS.h"
+#include "task.h"
+#include "main.h"
+#include "cmsis_os.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <rcl/rcl.h>
+#include <rcl/error_handling.h>
+#include <unistd.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <uxr/client/transport.h>
+#include <rmw_microxrcedds_c/config.h>
+#include <rmw_microros/rmw_microros.h>
+#include "std_msgs/msg/string.h"
+#include <stdio.h>
+#include <math.h>
+#include <geometry_msgs/msg/twist.h>
+#include <std_msgs/msg/float32_multi_array.h>
+#include <sensor_msgs/msg/joint_state.h>
+#include "dma.h"
+#include "tim.h"
+#include "usart.h"
+#include "gpio.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define FRAME_TIME 1
+#define PWM_MOTOR_MIN 0
+#define PWM_MOTOR_MAX 1000
+#define ENCODER_COUNTS_PER_REV 120
+#define ENCODER_SAMPLE_TIME_MS 500
+#define constrain(amt, low, high) ((amt) < (low) ? (low) : ((amt) > (high) ? (high) : (amt)))
+#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){printf("Failed status on line %d: %d. Aborting.\n",__LINE__,(int)temp_rc); vTaskDelete(NULL);}}
+#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){printf("Failed status on line %d: %d. Continuing.\n",__LINE__,(int)temp_rc);}}
+#define EXECUTE_EVERY_N_MS(MS, X) do { \
+	static volatile int64_t init = -1; \
+	if (init == -1) {init = HAL_GetTick();}\
+	if (HAL_GetTick() - init > MS) {X; init = HAL_GetTick();} \
+	} while (0)\
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+/* USER CODE BEGIN Variables */
+geometry_msgs__msg__Twist msg;
+rcl_subscription_t subscriber;
+rcl_node_t node;
+rclc_support_t support;
+rcl_timer_t timer;
+rcl_timer_t encoder_timer;
+rclc_executor_t executor;
+rcl_publisher_t encoder_publisher;
+sensor_msgs__msg__JointState joint_state_msg;
+static uint32_t last_connected_time = 0;
+bool is_connected = false;
+
+int32_t enc1_total = 0;
+int32_t enc2_total = 0;
+int32_t enc3_total = 0;
+int32_t enc4_total = 0;
+double joint_positions[4];  // Pozycje w radianach (float64)
+double joint_velocities[4]; // Prędkości w rad/s (float64)
+double joint_efforts[4];    // Moment obrotowy (float64) - pomijamy, ale musi być obecny
+static rosidl_runtime_c__String joint_names[4];
+/* USER CODE END Variables */
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = {
+  .name = "defaultTask",
+  .stack_size = 3000 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+enum states {
+	WAITING_AGENT,
+	AGENT_AVAILABLE,
+	AGENT_CONNECTED,
+	AGENT_DISCONNECTED
+} state;
+
+/* Private function prototypes -----------------------------------------------*/
+/* USER CODE BEGIN FunctionPrototypes */
+bool cubemx_transport_open(struct uxrCustomTransport * transport);
+bool cubemx_transport_close(struct uxrCustomTransport * transport);
+size_t cubemx_transport_write(struct uxrCustomTransport* transport, const uint8_t * buf, size_t len, uint8_t * err);
+size_t cubemx_transport_read(struct uxrCustomTransport* transport, uint8_t* buf, size_t len, int timeout, uint8_t* err);
+
+void * microros_allocate(size_t size, void * state);
+void microros_deallocate(void * pointer, void * state);
+void * microros_reallocate(void * pointer, size_t size, void * state);
+bool create_entities (void);
+static void setupPins(void);
+static void update_encoders(void);
+static void encoder_timer_callback(rcl_timer_t *timer, int64_t last_call_time);
+static void cmd_vel_callback(const void *msgin);
+static void timer_callback(rcl_timer_t *timer, int64_t last_call_time);
+static float fmap(float val, float in_min, float in_max, float out_min, float out_max);
+void * microros_zero_allocate(size_t number_of_elements, size_t size_of_element, void * state);
+
+static void cleanup(void);
+/* USER CODE END FunctionPrototypes */
+
+void StartDefaultTask(void *argument);
+
+void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
+
+/**
+  * @brief  FreeRTOS initialization
+  * @param  None
+  * @retval None
+  */
+void MX_FREERTOS_Init(void) {
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of defaultTask */
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+}
+
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+  * @brief  Function implementing the defaultTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void *argument)
+{
+	//NVIC_SystemReset();
+
+
+	    HAL_Init();
+	    SystemClock_Config();
+	    Init_joint_state_msg();
+	    MX_GPIO_Init();
+	    MX_TIM2_Init();
+	    MX_TIM1_Init();
+	    MX_TIM3_Init();
+	    MX_TIM5_Init();
+	    MX_TIM8_Init();
+	    setupPins();
+	    state =WAITING_AGENT;
+	    cleanup();
+
+	   // if (!is_connected) {
+	   	 //       uint32_t current_time = HAL_GetTick();
+	   	//	   uint32_t time_since_last = (last_connected_time == 0) ? current_time : (current_time - last_connected_time);
+	   	//	   if (time_since_last >= 500) {
+	   	//		   cleanup();
+	   	//		   NVIC_SystemReset(); // Resetuj MCU po 3 sekundach bez połączenia
+	   	//	   }
+
+	   	  // }
+
+/*
+	    while (1) {
+	        RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(FRAME_TIME)));
+	        update_encoders();
+	        HAL_Delay(FRAME_TIME);
+	    }
+
+	    cleanup();
+*/
+	    while (1) {
+	    	switch(state) {
+	    	 case WAITING_AGENT:
+	    	                if (rmw_uros_ping_agent(100, 3) == RMW_RET_OK) {
+	    	                    state = AGENT_AVAILABLE;
+	    	                }
+	    	                HAL_Delay(300);  // Zmniejsz częstotliwość sprawdzania
+	    	                break;
+
+	    	            case AGENT_AVAILABLE:
+	    	                if (create_entities()) {
+	    	                    state = AGENT_CONNECTED;
+	    	                } else {
+	    	                    cleanup();
+	    	                    state = WAITING_AGENT;
+	    	                }
+	    	                break;
+
+	    	            case AGENT_CONNECTED:
+	    	                if (rmw_uros_ping_agent(100, 3) != RMW_RET_OK) {
+	    	                    state = AGENT_DISCONNECTED;
+	    	                } else {
+	    	                    RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(FRAME_TIME)));
+	    	                    update_encoders();
+	    	                }
+	    	                HAL_Delay(FRAME_TIME);
+	    	                break;
+
+	    	            case AGENT_DISCONNECTED:
+	    	                cleanup();
+	    	                state = WAITING_AGENT;
+	    	                break;
+	    	}
+
+	    }
+	           /*rmw_ret_t ret = rmw_uros_ping_agent(100, 10);
+	           if (ret == RMW_RET_OK) {
+	               is_connected = true;
+	               last_connected_time = HAL_GetTick();
+	           } else {
+	               is_connected = false;
+	           }
+
+	           if (is_connected) {
+	               // Kontynuuj normalne operacje
+	               RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(FRAME_TIME)));
+	               update_encoders();
+	               HAL_Delay(FRAME_TIME);
+	           } else {
+	               uint32_t current_time = HAL_GetTick();
+	               uint32_t time_since_last = (last_connected_time == 0) ? current_time : (current_time - last_connected_time);
+	               if (time_since_last >= 500) {
+	            	   cleanup();
+	            	   HAL_Delay(100);
+	                   NVIC_SystemReset(); // Resetuj MCU po 3 sekundach bez połączenia
+	               }
+
+	           }
+	       }
+
+	       cleanup();
+	       is_connected = false;
+*/
+
+}
+
+
+
+/* Private application code --------------------------------------------------*/
+/* USER CODE BEGIN Application */
+
+bool create_entities() {
+	rmw_uros_set_custom_transport(
+		        true,
+		        (void *) &huart2,
+		        cubemx_transport_open,
+		        cubemx_transport_close,
+		        cubemx_transport_write,
+		        cubemx_transport_read);
+
+		    rcl_allocator_t freeRTOS_allocator = rcutils_get_zero_initialized_allocator();
+		    freeRTOS_allocator.allocate = microros_allocate;
+		    freeRTOS_allocator.deallocate = microros_deallocate;
+		    freeRTOS_allocator.reallocate = microros_reallocate;
+		    freeRTOS_allocator.zero_allocate = microros_zero_allocate;
+
+		    if (!rcutils_set_default_allocator(&freeRTOS_allocator)) {
+		        printf("Error setting allocator\n");
+		    }
+		    RCCHECK(rclc_support_init(&support, 0, NULL, &freeRTOS_allocator));
+		  	    RCCHECK(rclc_node_init_default(&node, "ros_stm32_diffdrive", "", &support));
+		  	    RCCHECK(rclc_subscription_init_default(
+		  	        &subscriber,
+		  	        &node,
+		  	        ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
+		  	        "/cmd_vel"));
+
+
+		  	    RCCHECK(rclc_publisher_init_default(
+		  	        &encoder_publisher,
+		  	        &node,
+		  	        ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
+		  	        "/JointState"));
+
+		  	    RCCHECK(rclc_timer_init_default(&timer, &support, RCL_MS_TO_NS(FRAME_TIME), timer_callback));
+		  	    RCCHECK(rclc_timer_init_default(&encoder_timer, &support, RCL_MS_TO_NS(ENCODER_SAMPLE_TIME_MS), encoder_timer_callback));
+		  	    RCCHECK(rclc_executor_init(&executor, &support.context, 3, &freeRTOS_allocator));
+		  	    RCCHECK(rclc_executor_add_subscription(&executor, &subscriber, &msg, &cmd_vel_callback, ON_NEW_DATA));
+		  	    RCCHECK(rclc_executor_add_timer(&executor, &timer));
+		  	    RCCHECK(rclc_executor_add_timer(&executor, &encoder_timer));
+		  	    return true;
+
+}
+
+void Init_joint_state_msg() {
+    // Nagłówek
+    //joint_state_msg.header.frame_id = NULL;  // Nie wymagane dla jointów
+	joint_state_msg.header.frame_id.data = (char*)"base_link";
+	joint_state_msg.header.frame_id.size = strlen(joint_state_msg.header.frame_id.data);
+	joint_state_msg.header.frame_id.capacity = joint_state_msg.header.frame_id.size + 1;
+
+	    // Nazwy jointów
+	    const char* names[] = {
+	        "left_front_wheel_joint",
+	        "left_rear_wheel_joint",
+	        "right_front_wheel_joint",
+	        "right_rear_wheel_joint"
+	    };
+
+	    for(int i = 0; i < 4; i++) {
+	        joint_names[i].data = (char*)names[i];
+	        joint_names[i].size = strlen(names[i]);
+	        joint_names[i].capacity = joint_names[i].size + 1;
+	    }
+    // Nazwy jointów
+    joint_state_msg.name.data = joint_names;
+    joint_state_msg.name.size = 4;
+    joint_state_msg.name.capacity = 4;
+
+    // Pozycje
+    joint_state_msg.position.data = joint_positions;
+    joint_state_msg.position.size = 4;
+    joint_state_msg.position.capacity = 4;
+
+    // Prędkości
+    joint_state_msg.velocity.data = joint_velocities;
+    joint_state_msg.velocity.size = 4;
+    joint_state_msg.velocity.capacity = 4;
+
+    // Effort (nieużywany - inicjalizujemy jako pusty)
+    joint_state_msg.effort.data = NULL;
+    joint_state_msg.effort.size = 0;
+    joint_state_msg.effort.capacity = 0;
+}
+static void setupPins(void) {
+	enc1_total = 0;
+	enc2_total = 0;
+	enc3_total = 0;
+	enc4_total = 0;
+    if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1) != HAL_OK ||
+        HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2) != HAL_OK ||
+        HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3) != HAL_OK ||
+        HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4) != HAL_OK) {
+        Error_Handler();
+    }
+    if (HAL_TIM_Encoder_Start(&htim1, TIM_CHANNEL_ALL) != HAL_OK ||
+        HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL) != HAL_OK ||
+        HAL_TIM_Encoder_Start(&htim5, TIM_CHANNEL_ALL) != HAL_OK ||
+        HAL_TIM_Encoder_Start(&htim8, TIM_CHANNEL_ALL) != HAL_OK) {
+        Error_Handler();
+    }
+}
+
+static void update_encoders(void) {
+    static uint16_t prev_enc1 = 0, prev_enc2 = 0, prev_enc3 = 0, prev_enc4 = 0;
+    uint16_t current_enc1 = htim1.Instance->CNT;
+    uint16_t current_enc2 = htim3.Instance->CNT;
+    uint16_t current_enc3 = htim8.Instance->CNT;
+    uint16_t current_enc4 = htim5.Instance->CNT;
+
+    enc1_total += (int16_t)(current_enc1 - prev_enc1);
+    enc2_total += (int16_t)(current_enc2 - prev_enc2);
+    enc3_total += (int16_t)(current_enc3 - prev_enc3);
+    enc4_total += (int16_t)(current_enc4 - prev_enc4);
+
+    prev_enc1 = current_enc1;
+    prev_enc2 = current_enc2;
+    prev_enc3 = current_enc3;
+    prev_enc4 = current_enc4;
+}
+
+static void encoder_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
+    (void)last_call_time;
+    if (!timer) return;
+
+    // Aktualizacja timestampu
+    int64_t time_ns = rmw_uros_epoch_nanos();
+    joint_state_msg.header.stamp.sec = time_ns / 1000000000;
+    joint_state_msg.header.stamp.nanosec = time_ns % 1000000000;
+
+    // Obliczenia pozycji (double precision)
+    const double rad_per_count = (2 * M_PI) / ENCODER_COUNTS_PER_REV;
+    joint_positions[0] = enc1_total * rad_per_count;
+    joint_positions[1] = enc2_total * rad_per_count;
+    joint_positions[2] = enc3_total * rad_per_count;
+    joint_positions[3] = enc4_total * rad_per_count;
+
+    // Obliczenia prędkości (double precision)
+    static int32_t prev_enc0  = 0, prev_enc1  = 0, prev_enc2  = 0, prev_enc3  = 0;
+    int32_t delta0 = enc1_total - prev_enc0;
+    int32_t delta1 = enc2_total - prev_enc1;
+    int32_t delta2 = enc3_total - prev_enc2;
+    int32_t delta3 = enc4_total - prev_enc3;
+
+
+    const double time_interval = ENCODER_SAMPLE_TIME_MS / 1000.0;
+    const double rpm_factor = 60.0f / (ENCODER_COUNTS_PER_REV * time_interval);
+    const float rpm_to_rad = 0.10472;
+    joint_velocities[0] = delta0 * rpm_factor * rpm_to_rad;
+    joint_velocities[1] = delta1 * rpm_factor * rpm_to_rad;
+    joint_velocities[2] = delta2 * rpm_factor * rpm_to_rad;
+    joint_velocities[3] = delta3 * rpm_factor * rpm_to_rad;
+
+    prev_enc0 = enc1_total;
+    prev_enc1 = enc2_total;
+    prev_enc2 = enc3_total;
+    prev_enc3 = enc4_total;
+
+
+    RCSOFTCHECK(rcl_publish(&encoder_publisher, &joint_state_msg, NULL));
+}
+
+static void cmd_vel_callback(const void *msgin) {
+    const geometry_msgs__msg__Twist *twist_msg = (const geometry_msgs__msg__Twist *)msgin;
+    if (twist_msg) {
+        msg = *twist_msg;
+    }
+}
+
+static void timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
+    (void)last_call_time;
+    if (!timer) return;
+
+    float linear = constrain(msg.linear.x, -1, 1);
+    float angular = constrain(msg.angular.z, -1, 1);
+    float left = linear - angular;
+    float right = linear + angular;
+
+    float max_value = fmax(fabs(left), fabs(right));
+    if (max_value > 1.0f) {
+        left /= max_value;
+        right /= max_value;
+    }
+
+    uint16_t pwmValueLeft = (uint16_t)fmap(fabs(left), 0, 1, PWM_MOTOR_MIN, PWM_MOTOR_MAX);
+    uint16_t pwmValueRight = (uint16_t)fmap(fabs(right), 0, 1, PWM_MOTOR_MIN, PWM_MOTOR_MAX);
+
+    HAL_GPIO_WritePin(Direction_Left_Front_GPIO_Port, Direction_Left_Front_Pin, left >= 0 ? GPIO_PIN_RESET : GPIO_PIN_SET);
+    HAL_GPIO_WritePin(Direction_Left_Rear_GPIO_Port, Direction_Left_Rear_Pin, left >= 0 ? GPIO_PIN_RESET : GPIO_PIN_SET);
+    HAL_GPIO_WritePin(Direction_Right_Front_GPIO_Port, Direction_Right_Front_Pin, right >= 0 ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Direction_Right_Rear_GPIO_Port, Direction_Right_Rear_Pin, right >= 0 ? GPIO_PIN_SET : GPIO_PIN_RESET);
+
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pwmValueLeft);
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, pwmValueLeft);
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, pwmValueRight);
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, pwmValueRight);
+}
+
+static float fmap(float val, float in_min, float in_max, float out_min, float out_max) {
+    return (val - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+static void cleanup(void) {
+    rmw_context_t * rmw_context = rcl_context_get_rmw_context(&support.context);
+    (void) rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+
+	rcl_timer_fini(&encoder_timer);
+    rcl_publisher_fini(&encoder_publisher, &node);
+    rcl_timer_fini(&timer);
+    rcl_subscription_fini(&subscriber, &node);
+    rcl_node_fini(&node);
+    rclc_support_fini(&support);
+}
+/* USER CODE END Application */
+
